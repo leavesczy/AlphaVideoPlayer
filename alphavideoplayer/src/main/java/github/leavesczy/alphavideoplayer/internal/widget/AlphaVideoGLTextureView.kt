@@ -27,7 +27,6 @@ internal class AlphaVideoGLTextureView(
     private var videoRenderer: IAlphaVideoRender? = null
 
     private val surfaceListener = object : IAlphaVideoRender.SurfaceListener {
-
         override fun onSurfacePrepared(surface: Surface) {
             surfaceCreated = true
             playerController?.surfacePrepared(surface = surface)
@@ -38,9 +37,9 @@ internal class AlphaVideoGLTextureView(
             playerController?.surfaceDestroyed()
         }
 
-        override fun onRenderSetupFailed(errorInfo: String) {
+        override fun onRenderSetupFailed(errorCode: AlphaVideo.ErrorCode, message: String) {
             surfaceCreated = false
-            playerController?.renderSetupFailed(errorInfo = errorInfo)
+            playerController?.renderSetupFailed(errorCode = errorCode, message = message)
         }
     }
 
@@ -192,16 +191,31 @@ internal class AlphaVideoGLTextureView(
     override fun onCompletion() {
         val renderer = videoRenderer ?: return
         renderer.clearCanDraw()
+        val latch = CountDownLatch(1)
         val apply = Runnable {
-            renderer.onCompletion()
+            try {
+                renderer.onCompletion()
+            } finally {
+                latch.countDown()
+            }
         }
         if (!queueEvent(runnable = apply)) {
             apply.run()
+            return
         }
+        // The next decoder must not start while this runnable can still drop its frame signal.
+        runCatching { latch.await(1L, TimeUnit.SECONDS) }
     }
 
     override fun onSurfaceLost() {
         videoRenderer?.clearCanDraw()
+    }
+
+    override fun fitDecoderBuffer(sourceWidth: Int, sourceHeight: Int): Boolean {
+        return videoRenderer?.fitDecoderBuffer(
+            sourceWidth = sourceWidth,
+            sourceHeight = sourceHeight
+        ) == true
     }
 
     override fun release() {
@@ -219,8 +233,10 @@ internal class AlphaVideoGLTextureView(
                 cleanup.run()
                 return
             }
+            // On timeout the queued teardown stays on the GL thread.
             latch.await(1L, TimeUnit.SECONDS)
         } catch (_: Exception) {
+            // The wait was interrupted. Tear down on this thread.
             runCatching { videoRenderer?.onSurfaceDestroyed(gl = null) }
         }
     }

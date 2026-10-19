@@ -5,21 +5,23 @@ import android.opengl.GLES20
 import android.opengl.Matrix
 import android.view.Surface
 import github.leavesczy.alphavideoplayer.AlphaVideo
+import github.leavesczy.alphavideoplayer.AlphaVideoLog
 import github.leavesczy.alphavideoplayer.internal.widget.IAlphaVideoRenderView
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Samples half-frame packed RGB + alpha from an OES [SurfaceTexture].
- * Outputs non-premultiplied RGBA with `GL_ONE` / `GL_ONE_MINUS_SRC_ALPHA`
- * (RGB half must be black-matted).
+ * Samples a half-frame RGB + alpha OES [SurfaceTexture].
+ * The fragment shader writes source RGB and the alpha half's green channel.
+ * Blend is `GL_ONE` / `GL_ONE_MINUS_SRC_ALPHA`, so the RGB half must be black-matted.
  */
 internal class AlphaVideoRenderer(
     private val renderView: IAlphaVideoRenderView
@@ -92,14 +94,31 @@ internal class AlphaVideoRenderer(
 
     private val updateSurface = AtomicBoolean(false)
 
-    /** After [onFirstFrame], a new OES buffer must arrive ([pendingFreshFrame] → [hasFreshFrame]) before draw. */
-    private val pendingFreshFrame = AtomicBoolean(false)
+    /** An OES frame was consumed. Drawing waits on this. Cleared when sampling stops or GL is released. */
+    private val frameLatched = AtomicBoolean(false)
 
-    private val hasFreshFrame = AtomicBoolean(false)
+    /** Skips later `updateTexImage` calls. Cleared when the session ends or a new OES texture is created. */
+    private val texImageFailureReported = AtomicBoolean(false)
 
     private var surfaceTexture: SurfaceTexture? = null
 
     private var playerSurface: Surface? = null
+
+    private val bufferLock = Any()
+
+    private val maxTextureSize = AtomicInteger(0)
+
+    private var packedWidth = 0
+
+    private var packedHeight = 0
+
+    private var appliedBufferWidth = 0
+
+    private var appliedBufferHeight = 0
+
+    private var samplingWidth = 0
+
+    private var samplingHeight = 0
 
     init {
         Matrix.setIdentityM(stMatrix, 0)
@@ -149,13 +168,19 @@ internal class AlphaVideoRenderer(
             scaleType = scaleType,
             layout = layout
         )
+        val (textureWidth, textureHeight) = samplingTextureSize(
+            videoWidth = videoWidth,
+            videoHeight = videoHeight
+        )
         verticesData = AlphaVideoTextureCropUtil.calculateVerticesData(
             layout = layout,
             scaleType = scaleType,
             viewWidth = viewWidth,
             viewHeight = viewHeight,
             videoWidth = videoWidth,
-            videoHeight = videoHeight
+            videoHeight = videoHeight,
+            textureWidth = textureWidth,
+            textureHeight = textureHeight
         )
         updateFloatBuffer(data = verticesData)
         if (canDraw.get()) {
@@ -165,15 +190,12 @@ internal class AlphaVideoRenderer(
 
     override fun onFirstFrame() {
         canDraw.set(true)
-        pendingFreshFrame.set(false)
-        hasFreshFrame.set(false)
         renderView.requestRender()
     }
 
     override fun clearCanDraw() {
         canDraw.set(false)
-        pendingFreshFrame.set(false)
-        hasFreshFrame.set(false)
+        frameLatched.set(false)
     }
 
     private fun isGeometryReady(): Boolean {
@@ -196,13 +218,38 @@ internal class AlphaVideoRenderer(
 
     override fun onCompletion() {
         canDraw.set(false)
-        pendingFreshFrame.set(false)
-        hasFreshFrame.set(false)
+        frameLatched.set(false)
+        texImageFailureReported.set(false)
         invalidateGeometry()
+        val texture = surfaceTexture
+        if (texture != null && updateSurface.compareAndSet(true, false)) {
+            try {
+                // Release the buffer. Dropping the signal here stalls every later video.
+                texture.updateTexImage()
+            } catch (e: Exception) {
+                AlphaVideoLog.w(
+                    component = COMPONENT,
+                    message = "updateTexImage during completion failed",
+                    throwable = e
+                )
+            }
+        }
         renderView.requestRender()
     }
 
+    override fun onEglSetupFailed(message: String) {
+        surfaceListener?.onRenderSetupFailed(
+            errorCode = AlphaVideo.ErrorCode.Egl,
+            message = message
+        )
+    }
+
     override fun onSurfaceCreated(gl: GL10, config: EGLConfig) {
+        val maxSize = IntArray(size = 1)
+        GLES20.glGetIntegerv(GLES20.GL_MAX_TEXTURE_SIZE, maxSize, 0)
+        if (maxSize[0] > 0) {
+            maxTextureSize.set(maxSize[0])
+        }
         if (surfaceTexture != null) {
             surfaceListener?.onSurfaceDestroyed()
         }
@@ -210,7 +257,10 @@ internal class AlphaVideoRenderer(
         try {
             programId = createProgram()
             if (programId == 0) {
-                surfaceListener?.onRenderSetupFailed(errorInfo = "Failed to create GL program")
+                surfaceListener?.onRenderSetupFailed(
+                    errorCode = AlphaVideo.ErrorCode.Render,
+                    message = "Failed to create GL program"
+                )
                 return
             }
             aPositionHandle = GLES20.glGetAttribLocation(programId, "aPosition")
@@ -223,20 +273,22 @@ internal class AlphaVideoRenderer(
             ) {
                 releaseGlResources()
                 surfaceListener?.onRenderSetupFailed(
-                    errorInfo = "Failed to resolve GL shader locations"
+                    errorCode = AlphaVideo.ErrorCode.Render,
+                    message = "Failed to resolve GL shader locations"
                 )
                 return
             }
             prepareSurface()
         } catch (e: Exception) {
-            AlphaVideo.Log.e(
+            AlphaVideoLog.e(
                 component = COMPONENT,
                 message = "onSurfaceCreated failed",
                 throwable = e
             )
             releaseGlResources()
             surfaceListener?.onRenderSetupFailed(
-                errorInfo = "onSurfaceCreated failure: ${e.stackTraceToString()}"
+                errorCode = AlphaVideo.ErrorCode.Render,
+                message = "onSurfaceCreated failure: ${e.message ?: e}"
             )
         }
     }
@@ -247,23 +299,32 @@ internal class AlphaVideoRenderer(
 
     override fun onDrawFrame(gl: GL10) {
         if (updateSurface.compareAndSet(true, false)) {
-            try {
-                surfaceTexture?.updateTexImage()
-                surfaceTexture?.getTransformMatrix(stMatrix)
-                if (pendingFreshFrame.compareAndSet(true, false)) {
-                    hasFreshFrame.set(true)
+            val texture = surfaceTexture
+            if (texture != null && !texImageFailureReported.get()) {
+                try {
+                    texture.updateTexImage()
+                    texture.getTransformMatrix(stMatrix)
+                    frameLatched.set(true)
+                } catch (e: Exception) {
+                    AlphaVideoLog.e(
+                        component = COMPONENT,
+                        message = "updateTexImage failed",
+                        throwable = e
+                    )
+                    canDraw.set(false)
+                    frameLatched.set(false)
+                    if (texImageFailureReported.compareAndSet(false, true)) {
+                        surfaceListener?.onRenderSetupFailed(
+                            errorCode = AlphaVideo.ErrorCode.Render,
+                            message = "updateTexImage failure: ${e.message ?: e}"
+                        )
+                    }
                 }
-            } catch (e: Exception) {
-                AlphaVideo.Log.w(
-                    component = COMPONENT,
-                    message = "updateTexImage failed",
-                    throwable = e
-                )
             }
         }
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 0.0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        if (!canDraw.get() || !hasFreshFrame.get() || !isGeometryReady() || programId == 0) {
+        if (!canDraw.get() || !frameLatched.get() || !isGeometryReady() || programId == 0) {
             return
         }
         GLES20.glEnable(GLES20.GL_BLEND)
@@ -312,9 +373,6 @@ internal class AlphaVideoRenderer(
 
     override fun onFrameAvailable(surface: SurfaceTexture) {
         updateSurface.set(true)
-        if (canDraw.get()) {
-            pendingFreshFrame.set(true)
-        }
         renderView.requestRender()
     }
 
@@ -344,7 +402,7 @@ internal class AlphaVideoRenderer(
             val linkStatus = IntArray(size = 1)
             GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
             if (linkStatus[0] != GLES20.GL_TRUE) {
-                AlphaVideo.Log.e(
+                AlphaVideoLog.e(
                     component = COMPONENT,
                     message = "Could not link program: ${GLES20.glGetProgramInfoLog(program)}"
                 )
@@ -365,7 +423,7 @@ internal class AlphaVideoRenderer(
             val compiled = IntArray(size = 1)
             GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
             if (compiled[0] == 0) {
-                AlphaVideo.Log.e(
+                AlphaVideoLog.e(
                     component = COMPONENT,
                     message = "Could not compile shader $shaderType: ${
                         GLES20.glGetShaderInfoLog(
@@ -407,27 +465,126 @@ internal class AlphaVideoRenderer(
             GLES20.GL_CLAMP_TO_EDGE
         )
         val texture = SurfaceTexture(textureId)
-        surfaceTexture = texture
-        val width = renderView.getMeasuredWidth().coerceAtLeast(minimumValue = 1)
-        val height = renderView.getMeasuredHeight().coerceAtLeast(minimumValue = 1)
-        texture.setDefaultBufferSize(width, height)
         texture.setOnFrameAvailableListener(this)
+        synchronized(bufferLock) {
+            surfaceTexture = texture
+            applyDecoderBufferSizeLocked()
+        }
         val surface = Surface(texture)
         playerSurface = surface
+        texImageFailureReported.set(false)
         surfaceListener?.onSurfacePrepared(surface = surface)
         updateSurface.set(false)
+    }
+
+    override fun fitDecoderBuffer(sourceWidth: Int, sourceHeight: Int): Boolean {
+        if (sourceWidth <= 0 || sourceHeight <= 0) {
+            return false
+        }
+        synchronized(bufferLock) {
+            packedWidth = sourceWidth
+            packedHeight = sourceHeight
+            return applyDecoderBufferSizeLocked()
+        }
+    }
+
+    private fun samplingTextureSize(videoWidth: Float, videoHeight: Float): Pair<Float, Float> {
+        synchronized(bufferLock) {
+            if (samplingWidth > 0 && samplingHeight > 0) {
+                return samplingWidth.toFloat() to samplingHeight.toFloat()
+            }
+        }
+        return when (layout) {
+            AlphaVideo.Layout.AlphaLeft, AlphaVideo.Layout.AlphaRight -> {
+                videoWidth * 2f to videoHeight
+            }
+
+            AlphaVideo.Layout.AlphaTop, AlphaVideo.Layout.AlphaBottom -> {
+                videoWidth to videoHeight * 2f
+            }
+        }
+    }
+
+    private fun applyDecoderBufferSizeLocked(): Boolean {
+        val sourceWidth = packedWidth
+        val sourceHeight = packedHeight
+        if (sourceWidth <= 0 || sourceHeight <= 0) {
+            return false
+        }
+        val maxSize = maxTextureSize.get()
+        // GL_MAX_TEXTURE_SIZE is known only after the context exists.
+        val (width, height) = if (maxSize > 0) {
+            fittedBufferSize(
+                sourceWidth = sourceWidth,
+                sourceHeight = sourceHeight,
+                maxSize = maxSize
+            )
+        } else {
+            sourceWidth to sourceHeight
+        }
+        samplingWidth = width
+        samplingHeight = height
+        val texture = surfaceTexture ?: return false
+        val changed = width != appliedBufferWidth || height != appliedBufferHeight
+        val downscaled = width != sourceWidth || height != sourceHeight
+        if (changed && (downscaled || appliedBufferWidth != 0)) {
+            texture.setDefaultBufferSize(width, height)
+            appliedBufferWidth = width
+            appliedBufferHeight = height
+            AlphaVideoLog.i(
+                component = COMPONENT,
+                message = "decoder buffer ${sourceWidth}x${sourceHeight} -> ${width}x${height} " +
+                        "maxTexture=$maxSize"
+            )
+            return true
+        }
+        if (appliedBufferWidth == 0) {
+            appliedBufferWidth = width
+            appliedBufferHeight = height
+        }
+        return false
+    }
+
+    private fun fittedBufferSize(
+        sourceWidth: Int,
+        sourceHeight: Int,
+        maxSize: Int
+    ): Pair<Int, Int> {
+        if (sourceWidth <= maxSize && sourceHeight <= maxSize) {
+            return sourceWidth to sourceHeight
+        }
+        val scale = min(
+            a = maxSize.toFloat() / sourceWidth.toFloat(),
+            b = maxSize.toFloat() / sourceHeight.toFloat()
+        )
+        var width = (sourceWidth * scale).toInt().coerceIn(minimumValue = 2, maximumValue = maxSize)
+        var height =
+            (sourceHeight * scale).toInt().coerceIn(minimumValue = 2, maximumValue = maxSize)
+        // Decoder buffers need even dimensions.
+        if (width % 2 != 0) {
+            width -= 1
+        }
+        if (height % 2 != 0) {
+            height -= 1
+        }
+        return width.coerceAtLeast(minimumValue = 2) to height.coerceAtLeast(minimumValue = 2)
     }
 
     private fun releaseGlResources() {
         canDraw.set(false)
         updateSurface.set(false)
-        pendingFreshFrame.set(false)
-        hasFreshFrame.set(false)
+        frameLatched.set(false)
         playerSurface?.release()
         playerSurface = null
-        surfaceTexture?.setOnFrameAvailableListener(null)
-        surfaceTexture?.release()
-        surfaceTexture = null
+        synchronized(bufferLock) {
+            surfaceTexture?.setOnFrameAvailableListener(null)
+            surfaceTexture?.release()
+            surfaceTexture = null
+            appliedBufferWidth = 0
+            appliedBufferHeight = 0
+            samplingWidth = 0
+            samplingHeight = 0
+        }
         if (textureId != 0) {
             GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
             textureId = 0
@@ -459,7 +616,7 @@ internal class AlphaVideoRenderer(
     private fun checkGlError(op: String) {
         val error = GLES20.glGetError()
         if (error != GLES20.GL_NO_ERROR) {
-            AlphaVideo.Log.e(
+            AlphaVideoLog.e(
                 component = COMPONENT,
                 message = "$op: glError $error"
             )
@@ -505,7 +662,7 @@ internal class AlphaVideoRenderer(
                 )
             }
         }
-        AlphaVideo.Log.i(
+        AlphaVideoLog.i(
             component = COMPONENT,
             message = "scaleDiagnostics rgb=${videoWidth.toInt()}x${videoHeight.toInt()} " +
                     "view=${viewWidth.toInt()}x${viewHeight.toInt()} " +

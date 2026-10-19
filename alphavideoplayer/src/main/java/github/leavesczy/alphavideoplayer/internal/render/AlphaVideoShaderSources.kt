@@ -20,7 +20,7 @@ void main() {
 }
 """
 
-    /** RGB from color UV; alpha from the alpha-half green channel (non-premultiplied). */
+    /** RGB from the color UV. Alpha is the green channel of the alpha half. */
     const val FRAGMENT = """
 #extension GL_OES_EGL_image_external : require
 precision mediump float;

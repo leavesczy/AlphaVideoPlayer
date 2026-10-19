@@ -4,7 +4,7 @@ import android.content.Context
 import android.graphics.SurfaceTexture
 import android.util.AttributeSet
 import android.view.TextureView
-import github.leavesczy.alphavideoplayer.AlphaVideo
+import github.leavesczy.alphavideoplayer.AlphaVideoLog
 import java.lang.ref.WeakReference
 import javax.microedition.khronos.egl.EGL10
 import javax.microedition.khronos.egl.EGL11
@@ -49,6 +49,8 @@ internal open class AlphaVideoBaseGLTextureView(
         fun onDrawFrame(gl: GL10)
 
         fun onSurfaceDestroyed(gl: GL10?)
+
+        fun onEglSetupFailed(message: String)
     }
 
     private val viewRef = WeakReference(this)
@@ -192,7 +194,7 @@ internal open class AlphaVideoBaseGLTextureView(
 
         private var eglContext: EGLContext? = null
 
-        fun start() {
+        fun start(anotherContextExists: Boolean): Boolean {
             val egl10 = EGLContext.getEGL() as EGL10
             egl = egl10
             val display = egl10.eglGetDisplay(EGL10.EGL_DEFAULT_DISPLAY)
@@ -207,7 +209,7 @@ internal open class AlphaVideoBaseGLTextureView(
             val view = viewRef.get() ?: run {
                 eglConfig = null
                 eglContext = null
-                return
+                return false
             }
             val config = chooseConfig(egl10 = egl10, display = display, view = view)
             eglConfig = config
@@ -227,23 +229,29 @@ internal open class AlphaVideoBaseGLTextureView(
             )
             if (context == null || context === EGL10.EGL_NO_CONTEXT) {
                 eglContext = null
-                throwEglException(function = "createContext", error = egl10.eglGetError())
+                val error = egl10.eglGetError()
+                if (anotherContextExists) {
+                    throw EglContextBusyException()
+                }
+                throwEglException(function = "createContext", error = error)
             }
             eglContext = context
             eglSurface = null
+            return true
         }
 
         fun createSurface(): Boolean {
-            val egl10 = egl ?: error(message = "egl not initialized")
-            val display = eglDisplay ?: error(message = "eglDisplay not initialized")
-            val config = eglConfig ?: error(message = "eglConfig not initialized")
+            val egl10 = egl ?: return false
+            val display = eglDisplay ?: return false
+            val config = eglConfig ?: return false
             destroySurface()
             val view = viewRef.get()
             val surface = if (view != null) {
                 try {
                     egl10.eglCreateWindowSurface(display, config, view.surfaceTexture, null)
                 } catch (e: IllegalArgumentException) {
-                    AlphaVideo.Log.e(
+                    // Some drivers throw IllegalArgumentException from eglCreateWindowSurface.
+                    AlphaVideoLog.e(
                         component = COMPONENT,
                         message = "eglCreateWindowSurface",
                         throwable = e
@@ -256,7 +264,7 @@ internal open class AlphaVideoBaseGLTextureView(
             eglSurface = surface
             if (surface == null || surface === EGL10.EGL_NO_SURFACE) {
                 if (egl10.eglGetError() == EGL10.EGL_BAD_NATIVE_WINDOW) {
-                    AlphaVideo.Log.e(
+                    AlphaVideoLog.e(
                         component = COMPONENT,
                         message = "createWindowSurface returned EGL_BAD_NATIVE_WINDOW"
                     )
@@ -270,9 +278,8 @@ internal open class AlphaVideoBaseGLTextureView(
             return true
         }
 
-        fun createGL(): GL10 {
+        fun createGL(): GL10? {
             return eglContext?.gl as? GL10
-                ?: error(message = "EGL context is not initialized")
         }
 
         fun swap(): Int {
@@ -338,25 +345,49 @@ internal open class AlphaVideoBaseGLTextureView(
                     0
                 }
             }
+
+            var bestConfig: EGLConfig? = null
+            var bestScore = Int.MAX_VALUE
             for (config in configs) {
-                if (config == null) continue
-                if (attrib(config = config, attribute = EGL10.EGL_DEPTH_SIZE) < view.depthSize) {
+                if (config == null) {
                     continue
                 }
-                if (attrib(
-                        config = config,
-                        attribute = EGL10.EGL_STENCIL_SIZE
-                    ) < view.stencilSize
+                val surfaceType = attrib(config = config, attribute = EGL10.EGL_SURFACE_TYPE)
+                if ((surfaceType and EGL10.EGL_WINDOW_BIT) == 0) {
+                    continue
+                }
+                val depth = attrib(config = config, attribute = EGL10.EGL_DEPTH_SIZE)
+                val stencil = attrib(config = config, attribute = EGL10.EGL_STENCIL_SIZE)
+                val red = attrib(config = config, attribute = EGL10.EGL_RED_SIZE)
+                val green = attrib(config = config, attribute = EGL10.EGL_GREEN_SIZE)
+                val blue = attrib(config = config, attribute = EGL10.EGL_BLUE_SIZE)
+                val alpha = attrib(config = config, attribute = EGL10.EGL_ALPHA_SIZE)
+                if (depth < view.depthSize || stencil < view.stencilSize ||
+                    red < view.redSize || green < view.greenSize ||
+                    blue < view.blueSize || alpha < view.alphaSize
                 ) {
                     continue
                 }
-                if (attrib(config = config, attribute = EGL10.EGL_RED_SIZE) == view.redSize &&
-                    attrib(config = config, attribute = EGL10.EGL_GREEN_SIZE) == view.greenSize &&
-                    attrib(config = config, attribute = EGL10.EGL_BLUE_SIZE) == view.blueSize &&
-                    attrib(config = config, attribute = EGL10.EGL_ALPHA_SIZE) == view.alphaSize
-                ) {
-                    return config
+                val score = (depth - view.depthSize) + (stencil - view.stencilSize) +
+                        (red - view.redSize) + (green - view.greenSize) +
+                        (blue - view.blueSize) + (alpha - view.alphaSize)
+                if (score < bestScore) {
+                    bestConfig = config
+                    bestScore = score
+                    if (score == 0) {
+                        break
+                    }
                 }
+            }
+            bestConfig?.let { config -> return config }
+            // No config met the channel floor. Still require a window surface.
+            val fallback = configs.firstOrNull { config ->
+                config != null &&
+                        (attrib(config = config, attribute = EGL10.EGL_SURFACE_TYPE) and
+                                EGL10.EGL_WINDOW_BIT) != 0
+            }
+            if (fallback != null) {
+                return fallback
             }
             throw IllegalArgumentException("No config chosen")
         }
@@ -369,6 +400,7 @@ internal open class AlphaVideoBaseGLTextureView(
                 EGL10.EGL_ALPHA_SIZE, view.alphaSize,
                 EGL10.EGL_DEPTH_SIZE, view.depthSize,
                 EGL10.EGL_STENCIL_SIZE, view.stencilSize,
+                EGL10.EGL_SURFACE_TYPE, EGL10.EGL_WINDOW_BIT,
                 EGL10.EGL_NONE
             )
             if (view.eglContextClientVersion != 2) {
@@ -389,7 +421,7 @@ internal open class AlphaVideoBaseGLTextureView(
             }
 
             fun logEglError(function: String, error: Int) {
-                AlphaVideo.Log.w(
+                AlphaVideoLog.w(
                     component = COMPONENT,
                     message = "$function failed: $error"
                 )
@@ -440,11 +472,23 @@ internal open class AlphaVideoBaseGLTextureView(
 
         override fun run() {
             name = "GLThread-${System.identityHashCode(this)}"
+            Thread.currentThread().setUncaughtExceptionHandler { _, throwable ->
+                reportGlFailure(message = throwable.message ?: throwable.javaClass.simpleName)
+            }
             try {
                 guardedRun()
             } catch (_: InterruptedException) {
+            } catch (e: Exception) {
+                reportGlFailure(message = e.message ?: e.javaClass.simpleName)
             } finally {
                 threadManager.threadExiting(thread = this)
+            }
+        }
+
+        private fun reportGlFailure(message: String) {
+            AlphaVideoLog.e(component = COMPONENT, message = "GL thread failure: $message")
+            runCatching {
+                viewRef.get()?.renderer?.onEglSetupFailed(message = message)
             }
         }
 
@@ -469,6 +513,8 @@ internal open class AlphaVideoBaseGLTextureView(
             var notifySurfaceDestroyed = false
             var notifyContextLost = false
             var exiting = false
+            // One Egl callback for this GL thread. Later surface failures only stop drawing.
+            var surfaceFailureReported = false
             try {
                 while (true) {
                     synchronized(lock = threadManager) {
@@ -534,15 +580,46 @@ internal open class AlphaVideoBaseGLTextureView(
                                     if (askedToReleaseEglContext) {
                                         askedToReleaseEglContext = false
                                     } else if (threadManager.tryAcquireEglContextLocked(thread = this)) {
+                                        var contextStarted = false
+                                        var startAborted = false
                                         try {
-                                            helper.start()
+                                            contextStarted = helper.start(
+                                                anotherContextExists = threadManager.hasOtherContextOwnerLocked(
+                                                    thread = this
+                                                )
+                                            )
+                                            if (!contextStarted) {
+                                                startAborted = true
+                                                helper.finish()
+                                            }
+                                        } catch (_: EglContextBusyException) {
+                                            // Leave the surface usable and wait for the other context to release.
+                                            threadManager.disallowMultipleContextsLocked()
+                                            helper.finish()
                                         } catch (t: RuntimeException) {
                                             threadManager.releaseEglContextLocked(thread = this)
-                                            throw t
+                                            helper.finish()
+                                            viewRef.get()?.renderer?.onEglSetupFailed(
+                                                message = t.message ?: "EGL setup failed"
+                                            )
+                                            exiting = true
+                                            break
                                         }
-                                        haveEglContext = true
-                                        createEglContext = true
-                                        threadManager.notifyAllLocked()
+                                        if (contextStarted) {
+                                            haveEglContext = true
+                                            createEglContext = true
+                                            threadManager.notifyAllLocked()
+                                        } else if (startAborted) {
+                                            // This surface does not start EGL again. A new TextureView surface can.
+                                            surfaceIsBad = true
+                                            threadManager.notifyAllLocked()
+                                            if (!surfaceFailureReported) {
+                                                surfaceFailureReported = true
+                                                viewRef.get()?.renderer?.onEglSetupFailed(
+                                                    message = "EGL setup aborted"
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                                 if (haveEglContext && !haveEglSurface) {
@@ -596,8 +673,13 @@ internal open class AlphaVideoBaseGLTextureView(
                     }
                     val pendingEvent = event
                     if (pendingEvent != null) {
-                        pendingEvent.run()
                         event = null
+                        try {
+                            pendingEvent.run()
+                        } catch (e: Exception) {
+                            reportGlFailure(message = e.message ?: e.javaClass.simpleName)
+                            shouldExit = true
+                        }
                         continue
                     }
                     if (createEglSurface) {
@@ -606,14 +688,34 @@ internal open class AlphaVideoBaseGLTextureView(
                                 surfaceIsBad = true
                                 threadManager.notifyAllLocked()
                             }
+                            if (!surfaceFailureReported) {
+                                surfaceFailureReported = true
+                                viewRef.get()?.renderer?.onEglSetupFailed(
+                                    message = "eglCreateWindowSurface failed"
+                                )
+                            }
                             continue
                         }
                         createEglSurface = false
                     }
                     if (createGlInterface) {
-                        gl = helper.createGL()
-                        threadManager.logGlRendererOnce(gl = gl)
-                        createGlInterface = false
+                        val createdGl = helper.createGL()
+                        if (createdGl == null) {
+                            synchronized(lock = threadManager) {
+                                surfaceIsBad = true
+                                threadManager.notifyAllLocked()
+                            }
+                            if (!surfaceFailureReported) {
+                                surfaceFailureReported = true
+                                viewRef.get()?.renderer?.onEglSetupFailed(
+                                    message = "EGL context is not initialized"
+                                )
+                            }
+                        } else {
+                            gl = createdGl
+                            threadManager.logGlRendererOnce(gl = createdGl)
+                            createGlInterface = false
+                        }
                     }
                     val currentGl = gl
                     val config = helper.eglConfig
@@ -633,7 +735,12 @@ internal open class AlphaVideoBaseGLTextureView(
                         sizeChangedFlag = false
                     }
                     if (currentGl != null) {
-                        viewRef.get()?.renderer?.onDrawFrame(currentGl)
+                        try {
+                            viewRef.get()?.renderer?.onDrawFrame(currentGl)
+                        } catch (e: Exception) {
+                            reportGlFailure(message = e.message ?: e.javaClass.simpleName)
+                            shouldExit = true
+                        }
                     }
                     when (val swapError = helper.swap()) {
                         EGL10.EGL_SUCCESS -> Unit
@@ -643,6 +750,12 @@ internal open class AlphaVideoBaseGLTextureView(
                             synchronized(lock = threadManager) {
                                 surfaceIsBad = true
                                 threadManager.notifyAllLocked()
+                            }
+                            if (!surfaceFailureReported) {
+                                surfaceFailureReported = true
+                                viewRef.get()?.renderer?.onEglSetupFailed(
+                                    message = "eglSwapBuffers failed: $swapError"
+                                )
                             }
                         }
                     }
@@ -800,13 +913,32 @@ internal open class AlphaVideoBaseGLTextureView(
 
         private var loggedRenderer = false
 
+        private var multipleContextsAllowed = true
+
         @Synchronized
         fun tryAcquireEglContextLocked(thread: GLThread): Boolean {
             if (eglOwner === thread || eglOwner == null) {
                 eglOwner = thread
                 notifyAllLocked()
+                return true
             }
-            return true
+            if (multipleContextsAllowed) {
+                return true
+            }
+            eglOwner?.requestReleaseEglContextLocked()
+            return false
+        }
+
+        @Synchronized
+        fun hasOtherContextOwnerLocked(thread: GLThread): Boolean {
+            return eglOwner != null && eglOwner !== thread
+        }
+
+        @Synchronized
+        fun disallowMultipleContextsLocked() {
+            multipleContextsAllowed = false
+            eglOwner?.requestReleaseEglContextLocked()
+            notifyAllLocked()
         }
 
         @Synchronized
@@ -836,7 +968,7 @@ internal open class AlphaVideoBaseGLTextureView(
                 return
             }
             loggedRenderer = true
-            AlphaVideo.Log.d(
+            AlphaVideoLog.d(
                 component = COMPONENT,
                 message = "GL renderer=${gl.glGetString(GL10.GL_RENDERER)}"
             )
@@ -852,5 +984,7 @@ internal open class AlphaVideoBaseGLTextureView(
             (this as Object).notifyAll()
         }
     }
+
+    private class EglContextBusyException : Exception()
 
 }

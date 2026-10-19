@@ -50,4 +50,6 @@ internal interface IAlphaVideoRenderView {
 
     fun release()
 
+    fun fitDecoderBuffer(sourceWidth: Int, sourceHeight: Int): Boolean
+
 }

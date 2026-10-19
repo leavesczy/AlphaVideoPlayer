@@ -1,6 +1,7 @@
 package github.leavesczy.alphavideoplayer
 
 import android.content.Context
+import android.media.MediaMetadataRetriever
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -22,6 +23,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Public methods may be called from any thread; [AlphaVideo.Listener] runs on the main thread.
  * No playlist. After [release], further commands are ignored.
  * [AlphaVideoView.setPlayer]`(null)` only detaches rendering — call [release] to free resources.
+ * Exceptions on the player, GL, and metadata threads are reported with [AlphaVideo.Listener.onError].
  */
 abstract class AlphaVideoPlayer protected constructor(
     context: Context,
@@ -39,7 +41,7 @@ abstract class AlphaVideoPlayer protected constructor(
 
     private var mediaItem: AlphaVideo.MediaItem? = null
 
-    /** Held until the OES decoder surface exists. */
+    /** Item deferred until the decoder OES surface exists. */
     private var pendingMediaItem: AlphaVideo.MediaItem? = null
 
     private var playerState = PlayerState.NOT_PREPARED
@@ -47,6 +49,9 @@ abstract class AlphaVideoPlayer protected constructor(
     private var playWhenReady = false
 
     private val released = AtomicBoolean(false)
+
+    /** Decoder surface must be cleared and set again so a new buffer size takes effect. */
+    private var rebindDecoderSurface = false
 
     /**
      * Session id for orchestrator commands. Stale Prepared / FirstFrame / Completed / Error are
@@ -69,7 +74,12 @@ abstract class AlphaVideoPlayer protected constructor(
     private val playThread = HandlerThread(
         "AlphaVideoPlayer",
         Process.THREAD_PRIORITY_DISPLAY
-    ).also { thread -> thread.start() }
+    ).also { thread ->
+        thread.setUncaughtExceptionHandler { _, throwable ->
+            reportUncaughtPlayerFailure(throwable = throwable)
+        }
+        thread.start()
+    }
 
     private val playHandler = Handler(playThread.looper)
 
@@ -92,13 +102,11 @@ abstract class AlphaVideoPlayer protected constructor(
             offer(command = PlayCommand.Completed(generation = playbackGeneration))
         }
 
-        override fun onError(what: Int, extra: Int, message: String) {
-            val detail = message.ifBlank { "what=$what extra=$extra" }
+        override fun onError(errorCode: AlphaVideo.ErrorCode, message: String) {
             offer(
                 command = PlayCommand.Error(
-                    message = "media player error: $detail",
-                    what = what,
-                    extra = extra,
+                    errorCode = errorCode,
+                    message = message,
                     generation = playbackGeneration
                 )
             )
@@ -128,7 +136,7 @@ abstract class AlphaVideoPlayer protected constructor(
 
     /** Replaces the item and resets the session; does not prepare or emit [AlphaVideo.Listener.onCompleted]. */
     fun setMediaItem(mediaItem: AlphaVideo.MediaItem) {
-        AlphaVideo.Log.i(
+        AlphaVideoLog.i(
             component = COMPONENT,
             message = "api setMediaItem source=${mediaItem.source} " +
                     "scaleType=${mediaItem.scaleType} layout=${mediaItem.layout} " +
@@ -139,7 +147,7 @@ abstract class AlphaVideoPlayer protected constructor(
 
     /** Clears GL sampling/geometry, then prepares (or defers until the decoder surface is ready). */
     fun prepare() {
-        AlphaVideo.Log.i(component = COMPONENT, message = "api prepare")
+        AlphaVideoLog.i(component = COMPONENT, message = "api prepare")
         offer(command = PlayCommand.Prepare)
     }
 
@@ -148,7 +156,7 @@ abstract class AlphaVideoPlayer protected constructor(
      * Without a decoder surface, keeps play intent until the surface is ready.
      */
     fun play() {
-        AlphaVideo.Log.i(component = COMPONENT, message = "api play")
+        AlphaVideoLog.i(component = COMPONENT, message = "api play")
         postToMain {
             showRenderView()
         }
@@ -157,26 +165,35 @@ abstract class AlphaVideoPlayer protected constructor(
 
     /** Clears play intent; does not emit [AlphaVideo.Listener.onCompleted]. */
     fun pause() {
-        AlphaVideo.Log.i(component = COMPONENT, message = "api pause")
+        AlphaVideoLog.i(component = COMPONENT, message = "api pause")
         offer(command = PlayCommand.Pause)
     }
 
     /** [AlphaVideo.Listener.onCompleted] only if playback had started (playing or paused). */
     fun stop() {
-        AlphaVideo.Log.i(component = COMPONENT, message = "api stop")
+        AlphaVideoLog.i(component = COMPONENT, message = "api stop")
         offer(command = PlayCommand.Stop)
     }
 
-    /** Frees decoder and GL resources. Idempotent. */
+    /**
+     * Frees decoder and GL resources. Idempotent.
+     * When the player thread has already exited, cleanup runs on the caller thread.
+     */
     fun release() {
         if (!released.compareAndSet(false, true)) {
-            AlphaVideo.Log.d(
+            AlphaVideoLog.d(
                 component = COMPONENT,
                 message = "api release ignored (already released)"
             )
             return
         }
-        AlphaVideo.Log.i(component = COMPONENT, message = "api release")
+        AlphaVideoLog.i(component = COMPONENT, message = "api release")
+        if (!playThread.isAlive) {
+            runCatching { mediaPlayer.release() }
+            runCatching { renderView.release() }
+            listener = null
+            return
+        }
         offer(command = PlayCommand.Destroy)
     }
 
@@ -196,12 +213,11 @@ abstract class AlphaVideoPlayer protected constructor(
         offer(command = PlayCommand.SurfaceDestroyed)
     }
 
-    internal fun renderSetupFailed(errorInfo: String) {
+    internal fun renderSetupFailed(errorCode: AlphaVideo.ErrorCode, message: String) {
         offer(
             command = PlayCommand.Error(
-                message = errorInfo,
-                what = 0,
-                extra = 0,
+                errorCode = errorCode,
+                message = message,
                 generation = playbackGeneration
             )
         )
@@ -238,7 +254,37 @@ abstract class AlphaVideoPlayer protected constructor(
             return
         }
         playHandler.post {
-            handleCommand(command = command)
+            try {
+                handleCommand(command = command)
+            } catch (e: Exception) {
+                logError(throwable = e, message = "player command failure")
+                // Release is already tearing the session down; another callback would race it.
+                if (released.get() || command is PlayCommand.Destroy) {
+                    return@post
+                }
+                val message = "internal failure: ${e.message ?: e}"
+                try {
+                    failPlayback(errorCode = AlphaVideo.ErrorCode.Internal, message = message)
+                } catch (ignored: Exception) {
+                    // failPlayback itself failed; still deliver the original error.
+                    emitError(errorCode = AlphaVideo.ErrorCode.Internal, message = message)
+                }
+            }
+        }
+    }
+
+    private fun reportUncaughtPlayerFailure(throwable: Throwable) {
+        logError(throwable = throwable, message = "player thread crashed")
+        // The player looper is dying, so decoder and GL stay up until release().
+        if (released.get()) {
+            return
+        }
+        val message = "internal failure: ${throwable.message ?: throwable.javaClass.simpleName}"
+        mainHandler.post {
+            if (released.get()) {
+                return@post
+            }
+            listener?.onError(errorCode = AlphaVideo.ErrorCode.Internal, message = message)
         }
     }
 
@@ -249,7 +295,10 @@ abstract class AlphaVideoPlayer protected constructor(
                     initMediaPlayer()
                 } catch (e: Exception) {
                     logError(throwable = e, message = "init media player failure")
-                    failPlayback(message = "init media player failure: ${e.message ?: e}")
+                    failPlayback(
+                        errorCode = AlphaVideo.ErrorCode.Init,
+                        message = "init media player failure: ${e.message ?: e}"
+                    )
                 }
             }
 
@@ -308,7 +357,7 @@ abstract class AlphaVideoPlayer protected constructor(
                     playerState != PlayerState.NOT_PREPARED ||
                     !awaitingPrepared
                 ) {
-                    AlphaVideo.Log.d(
+                    AlphaVideoLog.d(
                         component = COMPONENT,
                         message = "Prepared dropped gen=${command.generation}/$playbackGeneration " +
                                 "state=$playerState awaiting=$awaitingPrepared"
@@ -319,7 +368,7 @@ abstract class AlphaVideoPlayer protected constructor(
                 try {
                     parseVideoSize()
                     playerState = PlayerState.PREPARED
-                    AlphaVideo.Log.i(
+                    AlphaVideoLog.i(
                         component = COMPONENT,
                         message = "state PREPARED gen=$playbackGeneration playWhenReady=$playWhenReady"
                     )
@@ -327,14 +376,17 @@ abstract class AlphaVideoPlayer protected constructor(
                         startPlay()
                     }
                 } catch (e: Exception) {
-                    logError(throwable = e, message = "start video failure")
-                    failPlayback(message = "start video failure: ${e.message ?: e}")
+                    logError(throwable = e, message = "video size failure")
+                    failPlayback(
+                        errorCode = AlphaVideo.ErrorCode.VideoSize,
+                        message = e.message ?: "invalid video size"
+                    )
                 }
             }
 
             is PlayCommand.FirstFrame -> {
                 if (command.generation != playbackGeneration) {
-                    AlphaVideo.Log.d(
+                    AlphaVideoLog.d(
                         component = COMPONENT,
                         message = "FirstFrame dropped gen=${command.generation}/$playbackGeneration"
                     )
@@ -343,7 +395,7 @@ abstract class AlphaVideoPlayer protected constructor(
                 when (playerState) {
                     PlayerState.STARTED,
                     PlayerState.PAUSED -> {
-                        AlphaVideo.Log.d(
+                        AlphaVideoLog.d(
                             component = COMPONENT,
                             message = "firstFrame accepted state=$playerState gen=$playbackGeneration"
                         )
@@ -351,7 +403,7 @@ abstract class AlphaVideoPlayer protected constructor(
                     }
 
                     else -> {
-                        AlphaVideo.Log.d(
+                        AlphaVideoLog.d(
                             component = COMPONENT,
                             message = "FirstFrame ignored state=$playerState gen=$playbackGeneration"
                         )
@@ -365,7 +417,7 @@ abstract class AlphaVideoPlayer protected constructor(
                 if (playerState == PlayerState.STARTED) {
                     runCatching { mediaPlayer.pause() }
                     playerState = PlayerState.PAUSED
-                    AlphaVideo.Log.i(component = COMPONENT, message = "state PAUSED")
+                    AlphaVideoLog.i(component = COMPONENT, message = "state PAUSED")
                 }
             }
 
@@ -376,7 +428,7 @@ abstract class AlphaVideoPlayer protected constructor(
 
             is PlayCommand.Completed -> {
                 if (command.generation != playbackGeneration) {
-                    AlphaVideo.Log.d(
+                    AlphaVideoLog.d(
                         component = COMPONENT,
                         message = "Completed dropped gen=${command.generation}/$playbackGeneration"
                     )
@@ -385,7 +437,7 @@ abstract class AlphaVideoPlayer protected constructor(
                 if (playerState != PlayerState.STARTED &&
                     playerState != PlayerState.PAUSED
                 ) {
-                    AlphaVideo.Log.d(
+                    AlphaVideoLog.d(
                         component = COMPONENT,
                         message = "Completed ignored state=$playerState gen=$playbackGeneration"
                     )
@@ -401,7 +453,7 @@ abstract class AlphaVideoPlayer protected constructor(
 
             is PlayCommand.Error -> {
                 if (command.generation != playbackGeneration) {
-                    AlphaVideo.Log.d(
+                    AlphaVideoLog.d(
                         component = COMPONENT,
                         message = "Error dropped gen=${command.generation}/$playbackGeneration " +
                                 "msg=${command.message}"
@@ -409,9 +461,8 @@ abstract class AlphaVideoPlayer protected constructor(
                     return
                 }
                 failPlayback(
-                    message = command.message,
-                    what = command.what,
-                    extra = command.extra
+                    errorCode = command.errorCode,
+                    message = command.message
                 )
             }
 
@@ -429,16 +480,13 @@ abstract class AlphaVideoPlayer protected constructor(
         runCatching { mediaPlayer.reset() }
         renderView.onCompletion()
         playerState = PlayerState.NOT_PREPARED
-        if (!bindDecoderSurface(surface = currentSurface)) {
-            return
-        }
         bindMediaItemOutput(mediaItem = mediaItem, requireSurface = true)
     }
 
     private fun handlePendingMediaItem(): Boolean {
         val item = pendingMediaItem ?: return false
         pendingMediaItem = null
-        AlphaVideo.Log.i(
+        AlphaVideoLog.i(
             component = COMPONENT,
             message = "pendingMediaItem applied source=${item.source}"
         )
@@ -453,16 +501,98 @@ abstract class AlphaVideoPlayer protected constructor(
         renderView.setScaleType(scaleType = mediaItem.scaleType)
         renderView.setLayout(layout = mediaItem.layout)
         mediaPlayer.setLooping(looping = mediaItem.looping)
+        if (!applyTrackLimits(path = sourcePath)) {
+            return
+        }
         if (requireSurface && !renderView.isSurfaceCreated()) {
             pendingMediaItem = mediaItem
-            AlphaVideo.Log.i(
+            AlphaVideoLog.i(
                 component = COMPONENT,
                 message = "pendingMediaItem deferred (no decoder surface) source=${mediaItem.source}"
             )
             return
         }
+        if (rebindDecoderSurface) {
+            mediaPlayer.setSurface(surface = null)
+            rebindDecoderSurface = false
+        }
+        if (!bindDecoderSurface(surface = currentSurface)) {
+            return
+        }
         mediaPlayer.setSource(path = sourcePath)
         prepareMediaPlayer()
+    }
+
+    /**
+     * Rejects 90°/270° rotation and fits the decoder buffer to the GPU texture limit
+     * before the producer connects. A failed metadata read does not fail playback.
+     * Returns false when [failPlayback] has already run.
+     */
+    private fun applyTrackLimits(path: String): Boolean {
+        rebindDecoderSurface = false
+        val track = readVideoTrack(path = path) ?: return true
+        val rotation = normalizedRotation(degrees = track.rotationDegrees)
+        if (rotation == 90 || rotation == 270) {
+            failPlayback(
+                errorCode = AlphaVideo.ErrorCode.UnsupportedRotation,
+                message = "video rotation is $rotation degrees; export with rotation baked into the frames"
+            )
+            return false
+        }
+        if (track.width > 0 && track.height > 0) {
+            rebindDecoderSurface = renderView.fitDecoderBuffer(
+                sourceWidth = track.width,
+                sourceHeight = track.height
+            )
+        }
+        return true
+    }
+
+    private fun readVideoTrack(path: String): VideoTrack? {
+        val retriever = MediaMetadataRetriever()
+        try {
+            if (path.startsWith(prefix = "asset://")) {
+                val assetPath = AlphaVideoMediaPlayer.assetRelativePath(path = path)
+                appContext.assets.openFd(assetPath).use { fd ->
+                    retriever.setDataSource(fd.fileDescriptor, fd.startOffset, fd.length)
+                }
+            } else {
+                retriever.setDataSource(path)
+            }
+            return VideoTrack(
+                width = metadataInt(
+                    retriever = retriever,
+                    key = MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH
+                ),
+                height = metadataInt(
+                    retriever = retriever,
+                    key = MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT
+                ),
+                rotationDegrees = metadataInt(
+                    retriever = retriever,
+                    key = MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION
+                )
+            )
+        } catch (e: Exception) {
+            AlphaVideoLog.w(
+                component = COMPONENT,
+                message = "video track probe failed: $path",
+                throwable = e
+            )
+            return null
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
+    private fun metadataInt(retriever: MediaMetadataRetriever, key: Int): Int {
+        val raw = retriever.extractMetadata(key) ?: return 0
+        return raw.toIntOrNull() ?: raw.toFloatOrNull()?.toInt() ?: 0
+    }
+
+    private fun normalizedRotation(degrees: Int): Int {
+        val wrapped = degrees % 360
+        return if (wrapped < 0) wrapped + 360 else wrapped
     }
 
     /** Absolute file path or `asset:///<path>`; `null` if [failPlayback] was already invoked. */
@@ -471,7 +601,10 @@ abstract class AlphaVideoPlayer protected constructor(
             is AlphaVideo.Source.File -> {
                 val videoFile = source.file
                 if (!videoFile.exists()) {
-                    failPlayback(message = "file does not exist: ${videoFile.absolutePath}")
+                    failPlayback(
+                        errorCode = AlphaVideo.ErrorCode.FileNotFound,
+                        message = "file does not exist: ${videoFile.absolutePath}"
+                    )
                     return null
                 }
                 videoFile.absolutePath
@@ -480,13 +613,17 @@ abstract class AlphaVideoPlayer protected constructor(
             is AlphaVideo.Source.Asset -> {
                 val assetPath = source.path
                 if (assetPath.isBlank()) {
-                    failPlayback(message = "asset path is empty")
+                    failPlayback(
+                        errorCode = AlphaVideo.ErrorCode.AssetNotFound,
+                        message = "asset path is empty"
+                    )
                     return null
                 }
                 try {
                     appContext.assets.open(assetPath).close()
                 } catch (e: Exception) {
                     failPlayback(
+                        errorCode = AlphaVideo.ErrorCode.AssetNotFound,
                         message = "asset does not exist: $assetPath (${e.message ?: e})"
                     )
                     return null
@@ -508,7 +645,10 @@ abstract class AlphaVideoPlayer protected constructor(
     private fun bindDecoderSurface(surface: Surface?): Boolean {
         val ok = mediaPlayer.setSurface(surface = surface)
         if (!ok && surface != null) {
-            failPlayback(message = "setSurface failure")
+            failPlayback(
+                errorCode = AlphaVideo.ErrorCode.Surface,
+                message = "setSurface failure"
+            )
             return false
         }
         return true
@@ -523,19 +663,22 @@ abstract class AlphaVideoPlayer protected constructor(
                 try {
                     mediaPlayer.start()
                     playerState = PlayerState.STARTED
-                    AlphaVideo.Log.i(
+                    AlphaVideoLog.i(
                         component = COMPONENT,
                         message = "state STARTED gen=$playbackGeneration"
                     )
                     rearmFirstFrameIfHeld()
                     val callback = listener
                     postToMain {
-                        AlphaVideo.Log.i(component = COMPONENT, message = "listener onStart")
+                        AlphaVideoLog.i(component = COMPONENT, message = "listener onStart")
                         callback?.onStart()
                     }
                 } catch (e: Exception) {
                     logError(throwable = e, message = "start failure")
-                    failPlayback(message = "start failure: ${e.message ?: e}")
+                    failPlayback(
+                        errorCode = AlphaVideo.ErrorCode.Start,
+                        message = "start failure: ${e.message ?: e}"
+                    )
                 }
             }
 
@@ -543,14 +686,17 @@ abstract class AlphaVideoPlayer protected constructor(
                 try {
                     mediaPlayer.start()
                     playerState = PlayerState.STARTED
-                    AlphaVideo.Log.i(
+                    AlphaVideoLog.i(
                         component = COMPONENT,
                         message = "state STARTED (resume) gen=$playbackGeneration"
                     )
                     rearmFirstFrameIfHeld()
                 } catch (e: Exception) {
                     logError(throwable = e, message = "resume failure")
-                    failPlayback(message = "resume failure: ${e.message ?: e}")
+                    failPlayback(
+                        errorCode = AlphaVideo.ErrorCode.Resume,
+                        message = "resume failure: ${e.message ?: e}"
+                    )
                 }
             }
 
@@ -601,7 +747,7 @@ abstract class AlphaVideoPlayer protected constructor(
         }
     }
 
-    private fun failPlayback(message: String, what: Int = 0, extra: Int = 0) {
+    private fun failPlayback(errorCode: AlphaVideo.ErrorCode, message: String) {
         if (playerState == PlayerState.RELEASE) {
             return
         }
@@ -610,7 +756,7 @@ abstract class AlphaVideoPlayer protected constructor(
             decoderAction = DecoderAction.Reset,
             clearPlayWhenReady = true
         )
-        emitError(message = message, what = what, extra = extra)
+        emitError(errorCode = errorCode, message = message)
     }
 
     private fun resetPlaybackSession(
@@ -640,7 +786,7 @@ abstract class AlphaVideoPlayer protected constructor(
         }
         renderView.onCompletion()
         playerState = nextState
-        AlphaVideo.Log.i(
+        AlphaVideoLog.i(
             component = COMPONENT,
             message = "session reset $fromState->$nextState action=$decoderAction " +
                     "gen=$playbackGeneration playWhenReady=$playWhenReady"
@@ -653,7 +799,7 @@ abstract class AlphaVideoPlayer protected constructor(
     }
 
     private fun onDecoderSurfacePrepared(surface: Surface) {
-        AlphaVideo.Log.i(
+        AlphaVideoLog.i(
             component = COMPONENT,
             message = "surface prepared state=$playerState hold=$surfaceHold " +
                     "playWhenReady=$playWhenReady pending=${pendingMediaItem != null}"
@@ -683,10 +829,11 @@ abstract class AlphaVideoPlayer protected constructor(
 
             SurfaceHold.None -> Unit
         }
-        if (!bindDecoderSurface(surface = surface)) {
+        if (pendingMediaItem != null) {
+            handlePendingMediaItem()
             return
         }
-        if (handlePendingMediaItem()) {
+        if (!bindDecoderSurface(surface = surface)) {
             return
         }
         if (playWhenReady &&
@@ -697,7 +844,7 @@ abstract class AlphaVideoPlayer protected constructor(
     }
 
     private fun onDecoderSurfaceDestroyed() {
-        AlphaVideo.Log.i(
+        AlphaVideoLog.i(
             component = COMPONENT,
             message = "surface destroyed state=$playerState playWhenReady=$playWhenReady"
         )
@@ -773,7 +920,7 @@ abstract class AlphaVideoPlayer protected constructor(
             layout = layout
         )
         val scaleType = renderView.getScaleType()
-        AlphaVideo.Log.i(
+        AlphaVideoLog.i(
             component = COMPONENT,
             message = "videoSize source=${videoSize.width}x${videoSize.height} " +
                     "rgbHalf=${width}x${height} " +
@@ -786,7 +933,7 @@ abstract class AlphaVideoPlayer protected constructor(
         )
         val callback = listener
         postToMain {
-            AlphaVideo.Log.i(
+            AlphaVideoLog.i(
                 component = COMPONENT,
                 message = "listener onVideoSizeChanged ${width}x${height}"
             )
@@ -843,7 +990,7 @@ abstract class AlphaVideoPlayer protected constructor(
         renderView.onPause()
         playerState = PlayerState.RELEASE
         clearCallbacks()
-        // Let Media3 (and other) looper-bound release work finish before quitting the thread.
+        // release() may queue more work on this looper; let it run before the thread exits.
         playHandler.post {
             playThread.quitSafely()
         }
@@ -859,37 +1006,34 @@ abstract class AlphaVideoPlayer protected constructor(
             block()
         } catch (e: Exception) {
             logError(throwable = e, message = "set source failure")
-            failPlayback(message = "set source failure: ${e.message ?: e}")
+            failPlayback(
+                errorCode = AlphaVideo.ErrorCode.Source,
+                message = "set source failure: ${e.message ?: e}"
+            )
         }
     }
 
     private fun emitCompleted() {
         val callback = listener
         postToMain {
-            AlphaVideo.Log.i(component = COMPONENT, message = "listener onCompleted")
+            AlphaVideoLog.i(component = COMPONENT, message = "listener onCompleted")
             callback?.onCompleted()
         }
     }
 
-    private fun emitError(message: String, what: Int = 0, extra: Int = 0) {
+    private fun emitError(errorCode: AlphaVideo.ErrorCode, message: String) {
         val callback = listener
         postToMain {
-            AlphaVideo.Log.e(
+            AlphaVideoLog.e(
                 component = COMPONENT,
-                message = "listener onError what=$what extra=$extra msg=$message"
+                message = "listener onError code=${errorCode.code} name=$errorCode msg=$message"
             )
-            callback?.onError(
-                error = AlphaVideo.Error(
-                    message = message,
-                    what = what,
-                    extra = extra
-                )
-            )
+            callback?.onError(errorCode = errorCode, message = message)
         }
     }
 
     private fun logError(throwable: Throwable, message: String) {
-        AlphaVideo.Log.e(
+        AlphaVideoLog.e(
             component = COMPONENT,
             message = message,
             throwable = throwable
@@ -958,9 +1102,8 @@ abstract class AlphaVideoPlayer protected constructor(
         data class Completed(val generation: Int) : PlayCommand
 
         data class Error(
+            val errorCode: AlphaVideo.ErrorCode,
             val message: String,
-            val what: Int,
-            val extra: Int,
             val generation: Int
         ) : PlayCommand
 
@@ -970,5 +1113,11 @@ abstract class AlphaVideoPlayer protected constructor(
 
         data object Destroy : PlayCommand
     }
+
+    private data class VideoTrack(
+        val width: Int,
+        val height: Int,
+        val rotationDegrees: Int
+    )
 
 }

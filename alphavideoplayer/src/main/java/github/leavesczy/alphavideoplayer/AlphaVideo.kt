@@ -28,14 +28,27 @@ object AlphaVideo {
     )
 
     /**
-     * [message] is always set. [what] / [extra] are backend decoder codes when available;
-     * library-level failures often use `0`.
+     * Codes for [Listener.onError].
+     * [AssetNotFound] includes a blank asset path. [UnsupportedRotation] is 90° or 270°.
+     * [Decoder] leaves the backend status in the message.
+     * [Internal] is an unexpected failure inside the player; the message contains the exception.
      */
-    data class Error(
-        val message: String,
-        val what: Int,
-        val extra: Int
-    )
+    enum class ErrorCode(val code: Int) {
+        FileNotFound(1001),
+        AssetNotFound(1002),
+        UnsupportedRotation(1003),
+        Init(2001),
+        Source(2002),
+        Prepare(2003),
+        VideoSize(2004),
+        Start(2005),
+        Resume(2006),
+        Surface(2007),
+        Decoder(2008),
+        Render(3001),
+        Egl(3002),
+        Internal(9000)
+    }
 
     /** Main-thread playback callbacks. */
     interface Listener {
@@ -57,7 +70,7 @@ object AlphaVideo {
         }
 
         /** Ends the current item without [onCompleted]. */
-        fun onError(error: Error) {
+        fun onError(errorCode: ErrorCode, message: String) {
         }
     }
 
@@ -112,54 +125,6 @@ object AlphaVideo {
                 )
             }
         }
-    }
-
-    /** Optional logcat diagnostics (tag `AlphaVideoPlayer`). */
-    object Log {
-
-        private const val TAG = "AlphaVideoPlayer"
-
-        @Volatile
-        var enabled: Boolean = false
-
-        fun d(component: String, message: String) {
-            if (enabled) {
-                android.util.Log.d(TAG, format(component = component, message = message))
-            }
-        }
-
-        fun i(component: String, message: String) {
-            if (enabled) {
-                android.util.Log.i(TAG, format(component = component, message = message))
-            }
-        }
-
-        fun w(component: String, message: String, throwable: Throwable? = null) {
-            if (!enabled) {
-                return
-            }
-            if (throwable != null) {
-                android.util.Log.w(TAG, format(component = component, message = message), throwable)
-            } else {
-                android.util.Log.w(TAG, format(component = component, message = message))
-            }
-        }
-
-        fun e(component: String, message: String, throwable: Throwable? = null) {
-            if (!enabled) {
-                return
-            }
-            if (throwable != null) {
-                android.util.Log.e(TAG, format(component = component, message = message), throwable)
-            } else {
-                android.util.Log.e(TAG, format(component = component, message = message))
-            }
-        }
-
-        private fun format(component: String, message: String): String {
-            return if (component.isEmpty()) message else "[$component] $message"
-        }
-
     }
 
 }

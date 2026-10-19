@@ -49,7 +49,7 @@ abstract class AlphaVideoMediaPlayer {
 
         fun onCompleted()
 
-        fun onError(what: Int, extra: Int, message: String)
+        fun onError(errorCode: AlphaVideo.ErrorCode, message: String)
 
     }
 

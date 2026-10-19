@@ -4,7 +4,7 @@
 
 ## 接入依赖
 
-**必须依赖，通过系统 MediaPlayer 播放视频：**
+**基础依赖，通过系统 MediaPlayer 播放视频**
 
 ```kotlin
 dependencies {
@@ -12,25 +12,25 @@ dependencies {
 }
 ```
 
-**可选依赖，通过 ExoPlayer 播放视频，同时需引入 Media3：**
+**扩展依赖，通过 ExoPlayer 播放视频，因此需一起引入 media3-exoplayer**
 
 ```kotlin
 dependencies {
     implementation("io.github.leavesczy:alphavideoplayer-exoplayer:latestVersion")
-    implementation("androidx.media3:media3-exoplayer:latestVersion")
+    implementation("androidx.media3:media3-exoplayer:1.11.1")
 }
 ```
 
 ## 布局和缩放
 
-`AlphaVideo.Layout`
+`AlphaVideo.Layout` 用于标明视频的格式
 
 - `AlphaLeft`：左 Alpha，右 RGB
 - `AlphaRight`：左 RGB，右 Alpha
 - `AlphaTop`：上 Alpha，下 RGB
 - `AlphaBottom`：上 RGB，下 Alpha
 
-`AlphaVideo.ScaleType`
+`AlphaVideo.ScaleType` 用于标明视频的播放效果
 
 - `CenterCrop`：铺满裁剪，居中
 - `FitWidth`：宽度铺满；高度不够留白，超了裁剪
@@ -39,10 +39,8 @@ dependencies {
 
 ## 怎么用
 
-- `AlphaVideoSystemPlayer`：系统 `MediaPlayer`
+- `AlphaVideoSystemPlayer`： MediaPlayer
 - `AlphaVideoExoPlayer`：Media3 ExoPlayer
-
-把 player 挂到 `AlphaVideoView` 上播。`setPlayer` 只负责附着和拆卸；`play` / `pause` / `release` 自己调。用完先 `setPlayer(null)`，再 `release()`
 
 数据源用 `MediaItem.fromFile`（本地文件）或 `fromAsset`（`assets/` 的相对路径，如 `videos/foo.mp4`）
 
@@ -57,11 +55,10 @@ dependencies {
 
 ```kotlin
 val videoView: AlphaVideoView = findViewById(R.id.alphaVideoView)
-val player: AlphaVideoPlayer =
-    AlphaVideoSystemPlayer(context = this) // 或 AlphaVideoExoPlayer(context = this)
+val player: AlphaVideoPlayer = AlphaVideoSystemPlayer(context = this)
 player.setListener(listener = object : AlphaVideo.Listener {
     override fun onCompleted() {}
-    override fun onError(error: AlphaVideo.Error) {}
+    override fun onError(errorCode: AlphaVideo.ErrorCode, message: String) {}
 })
 videoView.setPlayer(player = player)
 
@@ -86,15 +83,16 @@ player.release()
 fun AlphaVideoOverlay(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val player = remember {
-        AlphaVideoSystemPlayer(context = context).also { // 或 AlphaVideoExoPlayer(context = context)
+        AlphaVideoSystemPlayer(context = context).also {
             it.setListener(listener = object : AlphaVideo.Listener {
                 override fun onCompleted() {}
-                override fun onError(error: AlphaVideo.Error) {}
+                override fun onError(errorCode: AlphaVideo.ErrorCode, message: String) {}
             })
         }
     }
     AndroidView(
-        modifier = modifier.fillMaxSize(),
+        modifier = modifier
+            .fillMaxSize(),
         factory = { viewContext ->
             AlphaVideoView(context = viewContext).also { view ->
                 view.setPlayer(player = player)
@@ -111,14 +109,15 @@ fun AlphaVideoOverlay(modifier: Modifier = Modifier) {
 ### 主要 API
 
 - `setMediaItem`：切换媒体资源
+- `setVolume`：线性音量，范围 `0f..1f`，默认 `0f`
 - `prepare` / `play` / `pause` / `stop` / `release`
 - `play`：未 prepare 时会先 prepare 再播；暂停中则恢复
-- `stop`：若已经开过播，会回调 `onCompleted`
+- `stop`：若已经播放过则会回调 `onCompleted`
 - `onVideoSizeChanged`：RGB 半幅尺寸
 - `onStart`：从 prepared 第一次开播时回调
 
 ### 调试
 
-`AlphaVideo.Log.enabled = true` 后，logcat tag 为 `AlphaVideoPlayer`。默认关闭
+`AlphaVideoLog.enabled = true` 后，logcat tag 为 `AlphaVideoPlayer`。默认关闭
 
 ![](https://github.com/user-attachments/assets/5dc1d426-f73b-4dad-b919-8b934f721bae)

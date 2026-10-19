@@ -17,6 +17,7 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import github.leavesczy.alphavideoplayer.AlphaVideo
+import github.leavesczy.alphavideoplayer.AlphaVideoLog
 import github.leavesczy.alphavideoplayer.AlphaVideoMediaPlayer
 import github.leavesczy.alphavideoplayer.AlphaVideoPlayer
 import java.io.File
@@ -50,7 +51,7 @@ private class ExoMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
 
     private var isPlayerReady = false
 
-    /** After [start]; [Callback.onFirstFrame] is deferred until this is true. */
+    /** [Callback.onFirstFrame] is held until [start] sets this. */
     private var playbackStarted = false
 
     private var pendingFirstFrame = false
@@ -68,13 +69,12 @@ private class ExoMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
             maybeNotifyPrepared()
             return@Runnable
         }
-        AlphaVideo.Log.e(
+        AlphaVideoLog.e(
             component = COMPONENT,
             message = "video size timeout after STATE_READY (${VIDEO_SIZE_TIMEOUT_MS}ms)"
         )
         playerCallback?.onError(
-            what = 0,
-            extra = 0,
+            errorCode = AlphaVideo.ErrorCode.VideoSize,
             message = "ExoPlayer video size unavailable after READY"
         )
     }
@@ -87,7 +87,7 @@ private class ExoMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
             when (playbackState) {
                 Player.STATE_READY -> {
                     isPlayerReady = true
-                    AlphaVideo.Log.i(
+                    AlphaVideoLog.i(
                         component = COMPONENT,
                         message = "STATE_READY hasSize=${currVideoWidth > 0 && currVideoHeight > 0} " +
                                 "size=${currVideoWidth}x${currVideoHeight}"
@@ -114,7 +114,7 @@ private class ExoMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
                 return
             }
             if (!playbackStarted) {
-                AlphaVideo.Log.d(
+                AlphaVideoLog.d(
                     component = COMPONENT,
                     message = "onRenderedFirstFrame deferred until start"
                 )
@@ -130,8 +130,7 @@ private class ExoMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
             }
             isPlayerReady = false
             playerCallback?.onError(
-                what = error.errorCode,
-                extra = 0,
+                errorCode = AlphaVideo.ErrorCode.Decoder,
                 message = buildErrorDescription(error = error)
             )
         }
@@ -224,8 +223,7 @@ private class ExoMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
             requirePlayer().prepare()
         } catch (e: Exception) {
             playerCallback?.onError(
-                what = 0,
-                extra = 0,
+                errorCode = AlphaVideo.ErrorCode.Prepare,
                 message = "ExoPlayer.prepare failed: ${e.message ?: e}"
             )
         }
@@ -285,6 +283,7 @@ private class ExoMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
         invalidateDecoderCallbacks()
         cancelVideoSizeTimeout()
         withSuppressedCallbacks {
+            exoPlayer?.clearVideoSurface()
             exoPlayer?.stop()
             exoPlayer?.playWhenReady = false
         }
@@ -303,6 +302,8 @@ private class ExoMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
         currVideoHeight = 0
         val player = exoPlayer ?: return
         withSuppressedCallbacks {
+            // Detach before the codec is released, or its callback thread dies while still bound.
+            player.clearVideoSurface()
             player.stop()
             player.clearMediaItems()
             player.playWhenReady = false

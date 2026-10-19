@@ -6,6 +6,7 @@ import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.view.Surface
 import github.leavesczy.alphavideoplayer.AlphaVideo
+import github.leavesczy.alphavideoplayer.AlphaVideoLog
 import github.leavesczy.alphavideoplayer.AlphaVideoMediaPlayer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -55,11 +56,11 @@ internal class SystemMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
             setOnErrorListener { _, what, extra ->
                 if (shouldDeliverCallback()) {
                     playerCallback?.onError(
-                        what = what,
-                        extra = extra,
-                        message = ""
+                        errorCode = AlphaVideo.ErrorCode.Decoder,
+                        message = "MediaPlayer error what=$what extra=$extra"
                     )
                 }
+                // true consumes the error, so onCompletion does not also run.
                 true
             }
             setOnVideoSizeChangedListener { _, width, height ->
@@ -100,14 +101,14 @@ internal class SystemMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
             player.setSurface(surface)
             true
         } catch (e: IllegalStateException) {
-            AlphaVideo.Log.w(
+            AlphaVideoLog.w(
                 component = "SystemMediaPlayer",
                 message = "setSurface failed, surface=$surface",
                 throwable = e
             )
             surface == null
         } catch (e: IllegalArgumentException) {
-            AlphaVideo.Log.w(
+            AlphaVideoLog.w(
                 component = "SystemMediaPlayer",
                 message = "setSurface failed, surface=$surface",
                 throwable = e
@@ -149,8 +150,7 @@ internal class SystemMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
             requirePlayer().prepareAsync()
         } catch (e: IllegalStateException) {
             playerCallback?.onError(
-                what = 0,
-                extra = 0,
+                errorCode = AlphaVideo.ErrorCode.Prepare,
                 message = "MediaPlayer.prepareAsync failed: ${e.message ?: e}"
             )
         }
@@ -210,6 +210,10 @@ internal class SystemMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
         invalidateDecoderCallbacks()
         withSuppressedCallbacks {
             try {
+                mediaPlayer?.setSurface(null)
+            } catch (_: IllegalStateException) {
+            }
+            try {
                 mediaPlayer?.stop()
             } catch (_: IllegalStateException) {
             }
@@ -220,6 +224,10 @@ internal class SystemMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
     override fun reset() {
         invalidateDecoderCallbacks()
         withSuppressedCallbacks {
+            try {
+                mediaPlayer?.setSurface(null)
+            } catch (_: IllegalStateException) {
+            }
             try {
                 mediaPlayer?.reset()
             } catch (_: IllegalStateException) {
@@ -317,13 +325,12 @@ internal class SystemMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
         }
         pendingPrepared = false
         hasNotifiedPrepared = true
-        AlphaVideo.Log.e(
+        AlphaVideoLog.e(
             component = "SystemMediaPlayer",
             message = message
         )
         playerCallback?.onError(
-            what = 0,
-            extra = 0,
+            errorCode = AlphaVideo.ErrorCode.VideoSize,
             message = message
         )
     }
@@ -389,6 +396,20 @@ internal class SystemMediaPlayer(context: Context) : AlphaVideoMediaPlayer() {
         return Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "AlphaVideo-Meta").also { thread ->
                 thread.isDaemon = true
+                thread.setUncaughtExceptionHandler { _, throwable ->
+                    // A size-read failure uses VideoSize. An exception that escapes this thread uses Internal.
+                    AlphaVideoLog.e(
+                        component = "SystemMediaPlayer",
+                        message = "metadata thread failure",
+                        throwable = throwable
+                    )
+                    runCatching {
+                        playerCallback?.onError(
+                            errorCode = AlphaVideo.ErrorCode.Internal,
+                            message = "metadata failure: ${throwable.message ?: throwable.javaClass.simpleName}"
+                        )
+                    }
+                }
             }
         }
     }

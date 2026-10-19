@@ -11,7 +11,9 @@ internal object AlphaVideoTextureCropUtil {
         viewWidth: Float,
         viewHeight: Float,
         videoWidth: Float,
-        videoHeight: Float
+        videoHeight: Float,
+        textureWidth: Float,
+        textureHeight: Float
     ): FloatArray {
         var videoWidth = videoWidth
         var videoHeight = videoHeight
@@ -68,7 +70,9 @@ internal object AlphaVideoTextureCropUtil {
                     leftZoomRatio = fitRatioX,
                     topZoomRatio = topZoomRatio,
                     rightZoomRatio = fitRatioX,
-                    bottomZoomRatio = bottomZoomRatio
+                    bottomZoomRatio = bottomZoomRatio,
+                    textureWidth = textureWidth,
+                    textureHeight = textureHeight
                 )
             }
 
@@ -81,7 +85,9 @@ internal object AlphaVideoTextureCropUtil {
                         leftCropRatio = 0f,
                         topCropRatio = cropY,
                         rightCropRatio = 0f,
-                        bottomCropRatio = cropY
+                        bottomCropRatio = cropY,
+                        textureWidth = textureWidth,
+                        textureHeight = textureHeight
                     )
                 } else {
                     val letterboxY = (1f - displayHeight / viewHeight) / 2f
@@ -90,7 +96,9 @@ internal object AlphaVideoTextureCropUtil {
                         leftZoomRatio = 0f,
                         topZoomRatio = letterboxY,
                         rightZoomRatio = 0f,
-                        bottomZoomRatio = letterboxY
+                        bottomZoomRatio = letterboxY,
+                        textureWidth = textureWidth,
+                        textureHeight = textureHeight
                     )
                 }
             }
@@ -101,7 +109,9 @@ internal object AlphaVideoTextureCropUtil {
                     leftCropRatio = ratioX,
                     topCropRatio = ratioY,
                     rightCropRatio = ratioX,
-                    bottomCropRatio = ratioY
+                    bottomCropRatio = ratioY,
+                    textureWidth = textureWidth,
+                    textureHeight = textureHeight
                 )
             }
         }
@@ -157,15 +167,47 @@ internal object AlphaVideoTextureCropUtil {
         )
     }
 
+    /** Keeps GL_LINEAR from sampling across the RGB/alpha split or the frame edge. */
+    private fun insetHalfTexel(
+        rect: UvRect,
+        textureWidth: Float,
+        textureHeight: Float
+    ): UvRect {
+        if (textureWidth < 2f || textureHeight < 2f) {
+            return rect
+        }
+        val halfU = 0.5f / textureWidth
+        val halfV = 0.5f / textureHeight
+        val u0 = rect.u0 + halfU
+        val v0 = rect.v0 + halfV
+        val u1 = rect.u1 - halfU
+        val v1 = rect.v1 - halfV
+        if (u0 >= u1 || v0 >= v1) {
+            // The inset would invert this rect.
+            return rect
+        }
+        return UvRect(u0 = u0, v0 = v0, u1 = u1, v1 = v1)
+    }
+
     private fun getZoomData(
         layout: AlphaVideo.Layout,
         leftZoomRatio: Float,
         topZoomRatio: Float,
         rightZoomRatio: Float,
-        bottomZoomRatio: Float
+        bottomZoomRatio: Float,
+        textureWidth: Float,
+        textureHeight: Float
     ): FloatArray {
-        val color = fullHalfUv(layout = layout, isAlpha = false)
-        val alpha = fullHalfUv(layout = layout, isAlpha = true)
+        val color = insetHalfTexel(
+            rect = fullHalfUv(layout = layout, isAlpha = false),
+            textureWidth = textureWidth,
+            textureHeight = textureHeight
+        )
+        val alpha = insetHalfTexel(
+            rect = fullHalfUv(layout = layout, isAlpha = true),
+            textureWidth = textureWidth,
+            textureHeight = textureHeight
+        )
         return floatArrayOf(
             -1.0f + leftZoomRatio * 2, -1.0f + bottomZoomRatio * 2, 0f,
             color.u0, color.v0, alpha.u0, alpha.v0,
@@ -183,23 +225,33 @@ internal object AlphaVideoTextureCropUtil {
         leftCropRatio: Float,
         topCropRatio: Float,
         rightCropRatio: Float,
-        bottomCropRatio: Float
+        bottomCropRatio: Float,
+        textureWidth: Float,
+        textureHeight: Float
     ): FloatArray {
-        val color = croppedHalfUv(
-            layout = layout,
-            isAlpha = false,
-            leftCropRatio = leftCropRatio,
-            topCropRatio = topCropRatio,
-            rightCropRatio = rightCropRatio,
-            bottomCropRatio = bottomCropRatio
+        val color = insetHalfTexel(
+            rect = croppedHalfUv(
+                layout = layout,
+                isAlpha = false,
+                leftCropRatio = leftCropRatio,
+                topCropRatio = topCropRatio,
+                rightCropRatio = rightCropRatio,
+                bottomCropRatio = bottomCropRatio
+            ),
+            textureWidth = textureWidth,
+            textureHeight = textureHeight
         )
-        val alpha = croppedHalfUv(
-            layout = layout,
-            isAlpha = true,
-            leftCropRatio = leftCropRatio,
-            topCropRatio = topCropRatio,
-            rightCropRatio = rightCropRatio,
-            bottomCropRatio = bottomCropRatio
+        val alpha = insetHalfTexel(
+            rect = croppedHalfUv(
+                layout = layout,
+                isAlpha = true,
+                leftCropRatio = leftCropRatio,
+                topCropRatio = topCropRatio,
+                rightCropRatio = rightCropRatio,
+                bottomCropRatio = bottomCropRatio
+            ),
+            textureWidth = textureWidth,
+            textureHeight = textureHeight
         )
         return floatArrayOf(
             -1.0f, -1.0f, 0f, color.u0, color.v0, alpha.u0, alpha.v0,

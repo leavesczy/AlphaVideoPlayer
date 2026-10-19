@@ -40,6 +40,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import github.leavesczy.alphavideoplayer.AlphaVideo
+import github.leavesczy.alphavideoplayer.AlphaVideoLog
 import github.leavesczy.alphavideoplayer.AlphaVideoPlayer
 import github.leavesczy.alphavideoplayer.AlphaVideoSystemPlayer
 import github.leavesczy.alphavideoplayer.AlphaVideoView
@@ -70,7 +71,7 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        AlphaVideo.Log.enabled = true
+        AlphaVideoLog.enabled = true
         enableEdgeToEdge(statusBarStyle = SystemBarStyle.dark(scrim = Color.TRANSPARENT))
         setContent {
             AppTheme {
@@ -134,9 +135,9 @@ private fun PlayerPage(
                 }
             }
 
-            override fun onError(error: AlphaVideo.Error) {
+            override fun onError(errorCode: AlphaVideo.ErrorCode, message: String) {
                 log {
-                    "onError $error"
+                    "onError code=${errorCode.code} name=$errorCode message=$message"
                 }
             }
         }

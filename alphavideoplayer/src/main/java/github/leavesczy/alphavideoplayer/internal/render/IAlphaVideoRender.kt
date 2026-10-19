@@ -15,7 +15,7 @@ internal interface IAlphaVideoRender :
 
         fun onSurfaceDestroyed()
 
-        fun onRenderSetupFailed(errorInfo: String)
+        fun onRenderSetupFailed(errorCode: AlphaVideo.ErrorCode, message: String)
 
     }
 
@@ -38,5 +38,11 @@ internal interface IAlphaVideoRender :
     fun clearCanDraw()
 
     fun onCompletion()
+
+    /**
+     * Fits the decoder buffer to the GPU texture limit.
+     * Returns true when the producer should attach the surface again.
+     */
+    fun fitDecoderBuffer(sourceWidth: Int, sourceHeight: Int): Boolean
 
 }
